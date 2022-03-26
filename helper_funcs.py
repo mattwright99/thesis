@@ -1,5 +1,4 @@
 import pickle
-from unittest.util import strclass
 import numpy as np
 from time import time
 from sympy import default_sort_key
@@ -11,11 +10,10 @@ import warnings
 warnings.filterwarnings('ignore')  # Ignore warnings
 
 from discopy import rigid
-from discopy.quantum import Circuit, Id, Measure
+from discopy.quantum import qubit, Circuit, Id, Measure, Bra
 
 from lambeq.ccg2discocat import DepCCGParser
 from lambeq.circuit import IQPAnsatz
-from lambeq.tensor import SpiderAnsatz
 from lambeq.core.types import AtomicType
 from lambeq.ansatz import Symbol
 
@@ -213,8 +211,7 @@ def remove_cups(diagram):
 
 def build_circuit(x:str, parser=DEFAULT_PARSER, ansatz=DEFAULT_ANSATZ):
     if type(x) is not str:
-        print('ERROR: `x` must be a string for build_circuit')
-        return None
+        raise Exception('ERROR: `x` must be a string for build_circuit')
     raw_diagram = parser.sentence2diagram(x)
     opt_diagram = remove_cups(raw_diagram)  # optimize circuit by reduce amount of post-selection
     circ = ansatz(opt_diagram)
@@ -237,63 +234,129 @@ def sort_data(x, y):
     sorted_y = np.concatenate([y[is_class_0], y[~is_class_0]])
     return sorted_x, sorted_y
 
-def get_transition_amp_sim_fn(backend_config={}, seed=SEED):
+def get_transition_amp_sim_fn_deprc(backend_config={}, seed=SEED):
+    print('WARNING: depreciated function - should use `transition_amp_sim_fn`')
+
     def fn(x_circ, y_circ):
         sim_circ = x_circ >> y_circ.dagger()
         return Circuit.eval(sim_circ, **backend_config, seed=seed).array[0]
     return fn
 
-def get_swap_test_fn(backend_config={}, seed=SEED):
-    def sim_fn(c1, c2):
-        tk_circ1 = c1.to_tk()
-        tk_circ2 = c2.to_tk()
+def transition_amp_sim_fn(x_circ, y_circ, backend_config={}, seed=SEED):
+    """Implements a transition amplitude of two DisCoCat sentences to estimate the two
+    state's fidelity. NOTE: this is buggy and only works for 1 qubit sentences.
+    
+    This is done by inverting one circuit, stripping the post-selction from the last set
+    of measurements (typically the three qubits that encode a transitive verb), and
+    replacing these with post-selection on the edge qubits (assuming that this is the
+    sentence pregroup qubit). This allows us then to measure only the transition ampplitude
+    on the sentence qubit by executing the kernel circuit and finding probability of measuring
+    0. This is all very sketchy and has not been tested in a range of scenarios.
 
-        # Create index mappers to stack c2 and c1
-        qubit_mapper = [n + tk_circ1.n_qubits for n in range(tk_circ2.n_qubits)]
-        bit_mapper = [n + tk_circ1.n_bits for n in range(tk_circ2.n_bits)]
-        tk_circ2_new_post_selection = {
-            q_idx + tk_circ1.n_bits : val for q_idx, val in tk_circ2.post_selection.items()
-        }
-        # Combine circuits in parallel
-        qc = tk_circ1.add_circuit(circuit=tk_circ2, qubits=qubit_mapper, bits=bit_mapper)
-        qc.post_select(tk_circ2_new_post_selection)
+    Parameters
+    ----------
+    x_circ : discopy.quantum.Circuit
+        Circuit representation of the first datapoint provided.
+    y_circ : discopy.quantum.Circuit
+        Circuit representation of the second datapoint provided.
+    backend_config : dict
+        Configuration parameters for executing the circuit when calling `get_counts()`.
+        Must include a quantum backend (e.g. `AerBackend`).
+    seed : int
+        Random number seed.
+    """
 
-        # Add 1 qubit/cbit circuit for ancillary bit
-        anc = tketCircuit(1, 1)
-        anc_qubit = qc.n_qubits
-        anc_cbit = qc.n_bits
-        qc.add_circuit(circuit=anc, qubits=[anc_qubit], bits=[anc_cbit])
+    # Find adjoint of second datapoint circuit
+    y_dagger = y_circ.dagger()
 
-        # Complete SWAT test
-        qc.H(anc_qubit)
-        # Find control and target qubits. Note that they are the unmeasured qubits
-        control_qubit = qc.qubits[-1]
-        target_qubits = []
-        for qubit in qc.qubits[:-1]:
-            if qubit not in qc.qubit_to_bit_map:  # unmeasured
-                target_qubits.append(qubit)
+    # Extract list of DiCoPy operations and their offsets - these will be adjusted
+    operations = y_dagger.boxes
+    offsets = y_dagger.offsets
+    # New values to build circuit from
+    new_ops = []
+    new_offs = []
+    # Iterate over definition of circuit and remove final post-selection
+    for i in range(len(operations)):
+        if not isinstance(operations[i], Bra):
+            # Immediately add operations that are not post-selecting Bras
+            new_ops.append(operations[i])
+            new_offs.append(offsets[i])
+        else:
+            # Add single Bras since sentence qubits are encoded with multiple neighbouring
+            # qubits (e.g. transitive verb has the tensor: $N \otimes S \otimes N$)
+            if len(operations[i].dom) == 1:
+                new_ops.append(operations[i])
+                new_offs.append(offsets[i])
 
-        qc.CSWAP(control_qubit, *target_qubits)
-        qc.H(anc_qubit)
-        qc.Measure(anc_qubit, anc_cbit)
+    dom = qubit  # domain of circuit
+    cod = qubit @ qubit @ qubit  # new codomain of circuit without final post-selection
+    yd_new = Circuit(dom, cod, new_ops, new_offs)
+    yd_new = yd_new >> Bra(0) @ Id(1) @ Bra(0)  # post-select edge noun qubits
 
-        # Execute circuit
-        res = qc.get_counts(**backend_config, seed=seed, normalize=True)
-        # Normalize results
-        total_p = sum(res[0].values())
-        res = {k : p/total_p for k, p in res[0].items()}
-        p0 = res.get((0,), 0.5)  # probability of measuring zero. If empty assume states are orthogonal
-        sim = 2 * p0 - 1  # estimate inner product (similarity) using a SWAP test
-        return sim
+    # Build and execute kernel circuit
+    kernel = x_circ >> yd_new
+    kernel = kernel.to_tk()
+    counts, = kernel.get_counts(**backend_config, seed=seed, measure_all=True, post_select=True)
 
-    return sim_fn
+    # Normalize probabilites
+    total_p = sum(counts.values())
+    res = {k : p/total_p for k, p in counts.items()}
+    # Similarity is probability of measuring 0s
+    sim = res.get((0,), 0)
+    return sim
 
+def swap_test_fn(c1, c2, backend_config={}, seed=SEED):
+    ts = time()
+    tk_circ1 = c1.to_tk()
+    tk_circ2 = c2.to_tk()
 
-def make_kernel_callback_fn(train_circs, test_circs, train_labels, test_labels, vocab, get_sim_fn=get_swap_test_fn, backend_config={}, seed=SEED):
+    # Create index mappers to stack c2 and c1
+    qubit_mapper = [n + tk_circ1.n_qubits for n in range(tk_circ2.n_qubits)]
+    bit_mapper = [n + tk_circ1.n_bits for n in range(tk_circ2.n_bits)]
+    tk_circ2_new_post_selection = {
+        q_idx + tk_circ1.n_bits : val for q_idx, val in tk_circ2.post_selection.items()
+    }
+    # Combine circuits in parallel
+    qc = tk_circ1.add_circuit(circuit=tk_circ2, qubits=qubit_mapper, bits=bit_mapper)
+    qc.post_select(tk_circ2_new_post_selection)
+
+    # Add 1 qubit/cbit circuit for ancillary bit
+    anc = tketCircuit(1, 1)
+    anc_qubit = qc.n_qubits
+    anc_cbit = qc.n_bits
+    qc.add_circuit(circuit=anc, qubits=[anc_qubit], bits=[anc_cbit])
+
+    # Find control and target qubits for swap test. Note that they are the unmeasured qubits
+    control_qubit = qc.qubits[-1]
+    target_qubits = []
+    for q in qc.qubits[:-1]:
+        if q not in qc.qubit_to_bit_map:  # unmeasured
+            target_qubits.append(q)
+
+    # Complete SWAT test
+    qc.H(anc_qubit)
+    qc.CSWAP(control_qubit, *target_qubits)
+    qc.H(anc_qubit)
+    qc.Measure(anc_qubit, anc_cbit)
+
+    t_setup = time() - ts
+    ts = time()
+
+    # Execute circuit
+    res = qc.get_counts(**backend_config, seed=seed, normalize=True)
+    # Normalize results
+    total_p = sum(res[0].values())
+    res = {k : p/total_p for k, p in res[0].items()}
+    p0 = res.get((0,), 0.5)  # probability of measuring zero. If empty assume states are orthogonal
+    sim = 2 * p0 - 1  # estimate inner product (similarity) using a SWAP test
+
+    t_execute = time() - ts
+    print('Execution took {:.3} %'.format(t_execute / (t_execute+t_setup)))
+    return sim
+
+def make_kernel_callback_fn(train_circs, test_circs, train_labels, test_labels, vocab, sim_fn=swap_test_fn, backend_config={}, seed=SEED):
     train_circs = [c.lambdify(*vocab) for c in train_circs]
     test_circs = [c.lambdify(*vocab) for c in test_circs]
-
-    sim_fn = get_sim_fn(backend_config=backend_config, seed=seed)
 
     n_train = len(train_circs)
     n_test = len(test_circs)
@@ -308,26 +371,29 @@ def make_kernel_callback_fn(train_circs, test_circs, train_labels, test_labels, 
 
         for i in range(n_train):
             for j in range(i+1):
-                sim = sim_fn(bound_train_circs[i], bound_train_circs[j])
+                sim = sim_fn(
+                    bound_train_circs[i], bound_train_circs[j], 
+                    backend_config=backend_config, seed=seed
+                )
                 gram_train[i, j] = sim
                 gram_train[j, i] = sim
 
         for r in range(gram_test.shape[0]):
             for c in range(gram_test.shape[1]):
-                gram_test[r, c] = sim_fn(bound_train_circs[c], bound_test_circs[r])
+                gram_test[r, c] = sim_fn(
+                    bound_train_circs[c], bound_test_circs[r], 
+                    backend_config=backend_config, seed=seed
+                )
 
         svc = SVC(kernel="precomputed")
         svc.fit(gram_train, train_labels[:, 0])
         score = svc.score(gram_test, test_labels[:, 0])
         accuracies.append(score)
         return score
-    
-    return callback_fn, accuracies
 
+    return callback_fn, accuracies
     
-def make_kernel_fn(params, param_vals, get_sim_fn=get_swap_test_fn, parser=DEFAULT_PARSER, ansatz=DEFAULT_ANSATZ, backend_config={}, seed=SEED):
-    sim_fn = get_sim_fn(backend_config=backend_config, seed=seed)
-    
+def make_kernel_fn(params, param_vals, sim_fn=swap_test_fn, parser=DEFAULT_PARSER, ansatz=DEFAULT_ANSATZ, backend_config={}, seed=SEED):    
     def kernel_fn(x, y):
         if type(x) is str:
             x = [x]
@@ -338,95 +404,82 @@ def make_kernel_fn(params, param_vals, get_sim_fn=get_swap_test_fn, parser=DEFAU
         ts = time()
         x_circs = build_circuits(x, parser=parser, ansatz=ansatz)
         y_circs = build_circuits(y, parser=parser, ansatz=ansatz)
-        
+
         x_circs = [c.lambdify(*params)(*param_vals) for c in x_circs]
         y_circs = [c.lambdify(*params)(*param_vals) for c in y_circs]
         timestamp(time(), ts, 'to prep circs')
-        
+
         ts = time()
         kernel_mat = np.zeros((len(x), len(y)))
         for r in range(len(x)):
             for c in range(len(y)):
-                kernel_mat[r, c] = sim_fn(x_circs[r], y_circs[c])
+                kernel_mat[r, c] = sim_fn(
+                    x_circs[r], y_circs[c], 
+                    backend_config=backend_config, seed=seed
+                )
 
         timestamp(time(), ts, 'to build matrix')
         return kernel_mat
-    
+
     return kernel_fn
 
-def make_circ_kernel_fn(get_sim_fn=get_swap_test_fn, backend_config={}, seed=SEED):
-    sim_fn = get_sim_fn(backend_config=backend_config, seed=seed)
-    
+def make_circ_kernel_fn(sim_fn=swap_test_fn, backend_config={}, seed=SEED):
     def kernel_fn(x_circs, y_circs):      
         nx = len(x_circs)
         ny = len(y_circs)
         kernel_mat = np.zeros((nx, ny))
         for r in range(nx):
             for c in range(ny):
-                kernel_mat[r, c] = sim_fn(x_circs[r], y_circs[c])
+                kernel_mat[r, c] = sim_fn(
+                    x_circs[r], y_circs[c], 
+                    backend_config=backend_config, seed=seed
+                )
         return kernel_mat
-    
     return kernel_fn
 
-
-def build_gram_matrices(x_train, x_test, params, param_vals, get_sim_fn=get_swap_test_fn, parser=DEFAULT_PARSER, ansatz=DEFAULT_ANSATZ, backend_config={}, seed=SEED):
-    ts = time()
-    print('Building circuits...')
-    train_circs = build_circuits(x_train, parser=parser, ansatz=ansatz)
-    test_circs = build_circuits(x_test, parser=parser, ansatz=ansatz)
-    
-    train_circs = [c.lambdify(*params)(*param_vals) for c in train_circs]
-    test_circs = [c.lambdify(*params)(*param_vals) for c in test_circs]
-    timestamp(time(), ts)
-
-    sim_fn = get_sim_fn(backend_config=backend_config, seed=seed)
-    
-    ts = time()
-    print('Building training Gram matrix...')
-    n_train = len(x_train)
-    gram_train = np.zeros((n_train, n_train))
-    for i in range(n_train):
-        for j in range(i+1):
-            sim = sim_fn(train_circs[i], train_circs[j])
-            gram_train[i, j] = sim
-            gram_train[j, i] = sim
-    timestamp(time(), ts)
-    
-    ts = time()
-    print('Building testing Gram matrix...')
-    n_test = len(x_test)
-    gram_test = np.zeros((n_test, n_train))
-    for r in range(gram_test.shape[0]):
-        for c in range(gram_test.shape[1]):
-            gram_test[r, c] = sim_fn(train_circs[c], test_circs[r])
-    timestamp(time(), ts)
-    
-    return gram_train, gram_test
-
-def build_gram_matrices_from_circ(train_circs, test_circs, get_sim_fn=get_swap_test_fn, backend_config={}, seed=SEED):
-    sim_fn = get_sim_fn(backend_config=backend_config, seed=seed)
-    
+def build_gram_matrices_from_circ(train_circs, test_circs, sim_fn=swap_test_fn, backend_config={}, seed=SEED):
     ts = time()
     print('Building training Gram matrix...')
     n_train = len(train_circs)
     gram_train = np.zeros((n_train, n_train))
     for i in range(n_train):
         for j in range(i+1):
-            sim = sim_fn(train_circs[i], train_circs[j])
+            sim = sim_fn(
+                train_circs[i], train_circs[j],
+                backend_config=backend_config, seed=seed
+            )
             gram_train[i, j] = sim
             gram_train[j, i] = sim
     timestamp(time(), ts)
-    
+
     ts = time()
     print('Building testing Gram matrix...')
-    n_test = len(x_test)
+    n_test = len(test_circs)
     gram_test = np.zeros((n_test, n_train))
     for r in range(gram_test.shape[0]):
         for c in range(gram_test.shape[1]):
-            gram_test[r, c] = sim_fn(train_circs[c], test_circs[r])
+            gram_test[r, c] = sim_fn(
+                train_circs[c], test_circs[r],
+                backend_config=backend_config, seed=seed
+            )
     timestamp(time(), ts)
-    
+
     return gram_train, gram_test
+
+def build_gram_matrices(x_train, x_test, params, param_vals, sim_fn=swap_test_fn, parser=DEFAULT_PARSER, ansatz=DEFAULT_ANSATZ, backend_config={}, seed=SEED):
+    ts = time()
+    print('Building circuits...')
+    train_circs = build_circuits(x_train, parser=parser, ansatz=ansatz)
+    test_circs = build_circuits(x_test, parser=parser, ansatz=ansatz)
+
+    train_circs = [c.lambdify(*params)(*param_vals) for c in train_circs]
+    test_circs = [c.lambdify(*params)(*param_vals) for c in test_circs]
+    timestamp(time(), ts)
+
+    return build_gram_matrices_from_circ(
+        train_circs, test_circs, sim_fn=sim_fn, 
+        backend_config=backend_config, seed=seed
+    )
 
 def display_grams(gram_train, gram_test, save_name=''):
     fig, axs = plt.subplots(1, 2, figsize=(10, 5))
